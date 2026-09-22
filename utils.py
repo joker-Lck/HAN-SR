@@ -2,6 +2,67 @@ import torch
 import numpy as np
 from PIL import Image
 
+# 统一网络结构默认值（训练/推理必须一致，否则 state_dict 对不上）
+ARCH_DEFAULTS = {
+    'in_nc': 3,
+    'out_nc': 3,
+    'nf': 64,
+    'nb': 16,
+    'gc': 32,
+    'upscale': 4,
+    'context_dim': 64,
+    'exposure_feat_dim': 32,
+    'upsample_mode': 'pixelshuffle',
+    'norm_type': None,
+    'act_type': 'leakyrelu',
+    'mode': 'CNA',
+}
+
+
+def build_generator(arch_cfg=None):
+    from architecture import RRDB_Net
+    cfg = {**ARCH_DEFAULTS, **(arch_cfg or {})}
+    return RRDB_Net(
+        cfg['in_nc'], cfg['out_nc'], cfg['nf'], cfg['nb'], gc=cfg['gc'],
+        upscale=cfg['upscale'], norm_type=cfg['norm_type'],
+        act_type=cfg['act_type'], mode=cfg['mode'],
+        upsample_mode=cfg['upsample_mode'],
+        context_dim=cfg['context_dim'],
+        exposure_feat_dim=cfg['exposure_feat_dim'],
+    )
+
+
+def save_checkpoint(model, path, optimizer=None, epoch=0, loss=None, arch_cfg=None):
+    """统一 checkpoint 格式: {'state_dict', 'arch', 'epoch', 'loss', 'optimizer'?}"""
+    payload = {
+        'state_dict': model.state_dict(),
+        'arch': {**ARCH_DEFAULTS, **(arch_cfg or {})},
+        'epoch': epoch,
+        'loss': loss,
+    }
+    if optimizer is not None:
+        payload['optimizer'] = optimizer.state_dict()
+    torch.save(payload, path)
+
+
+def load_checkpoint(path, map_location='cpu'):
+    """
+    兼容三种历史格式，返回 (state_dict, meta):
+      1. 新格式: {'state_dict': ..., 'arch': ...}
+      2. train.py 旧格式: {'model_state_dict': ...}
+      3. 裸 state_dict
+    """
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+        return ckpt['state_dict'], ckpt
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        meta = dict(ckpt)
+        meta.setdefault('arch', ARCH_DEFAULTS)
+        return ckpt['model_state_dict'], meta
+    if isinstance(ckpt, dict) and len(ckpt) > 0 and all(hasattr(v, 'shape') for v in ckpt.values()):
+        return ckpt, {'state_dict': ckpt, 'arch': dict(ARCH_DEFAULTS)}
+    raise ValueError('Unrecognized checkpoint format: %r' % (type(ckpt),))
+
 
 def get_imgs_fn(file_name, path):
     """Input an image path and name, return an image array"""

@@ -1,7 +1,9 @@
 from collections import OrderedDict
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
 
 ####################
 # Basic blocks
@@ -311,19 +313,35 @@ class RelativeExposureEncoder(nn.Module):
         """
         正弦位置编码：类似Transformer的位置编码
         让网络知道每个像素的空间位置，从而感知渐变方向
+
+        通道布局: [sin_h_0, cos_h_0, sin_h_1, cos_h_1, ...,
+                   sin_w_0, cos_w_0, sin_w_1, cos_w_1, ...]
+        前半部分编码高度位置，后半部分编码宽度位置，各占 dim/2 通道。
+
+        修复说明:
+        原代码 pe[half_dim::2] 起始索引超过通道数，宽度编码完全丢失。
+        同时修正了维度广播顺序（pos[h, freq] -> pe[freq, h, w]）。
         """
         pe = torch.zeros(dim, h, w)
-        half_dim = dim // 2
+        half_dim = dim // 2  # 高度和宽度各占一半通道
+        num_freq = half_dim // 2  # sin/cos成对，各 num_freq 个频率
         div_term = torch.exp(
-            torch.arange(0, half_dim, 2).float() * (-math.log(10000.0) / half_dim)
+            torch.arange(0, num_freq).float() * (-math.log(10000.0) / num_freq)
         )
-        pos_h = torch.arange(0, h).float().unsqueeze(1)
-        pe[0:half_dim:2, :, :] = torch.sin(pos_h * div_term).unsqueeze(2).expand(-1, -1, w)
-        pe[1:half_dim:2, :, :] = torch.cos(pos_h * div_term).unsqueeze(2).expand(-1, -1, w)
+        # 高度编码：pe[0:half_dim]，共 half_dim 通道（num_freq个sin + num_freq个cos）
+        pos_h = torch.arange(0, h).float().unsqueeze(1)  # [h, 1]
+        sin_h = torch.sin(pos_h * div_term)  # [h, num_freq]
+        cos_h = torch.cos(pos_h * div_term)  # [h, num_freq]
+        # 交错排列: pe[0]=sin_h_0, pe[1]=cos_h_0, pe[2]=sin_h_1, pe[3]=cos_h_1, ...
+        pe[0:half_dim:2, :, :] = sin_h.permute(1, 0).unsqueeze(2).expand(-1, -1, w)
+        pe[1:half_dim:2, :, :] = cos_h.permute(1, 0).unsqueeze(2).expand(-1, -1, w)
 
-        pos_w = torch.arange(0, w).float().unsqueeze(1)
-        pe[half_dim::2, :, :] = torch.sin(pos_w * div_term).unsqueeze(1).expand(-1, h, -1)
-        pe[half_dim + 1::2, :, :] = torch.cos(pos_w * div_term).unsqueeze(1).expand(-1, h, -1)
+        # 宽度编码：pe[half_dim:dim]，共 half_dim 通道
+        pos_w = torch.arange(0, w).float().unsqueeze(1)  # [w, 1]
+        sin_w = torch.sin(pos_w * div_term)  # [w, num_freq]
+        cos_w = torch.cos(pos_w * div_term)  # [w, num_freq]
+        pe[half_dim:dim:2, :, :] = sin_w.permute(1, 0).unsqueeze(1).expand(-1, h, -1)
+        pe[half_dim + 1:dim:2, :, :] = cos_w.permute(1, 0).unsqueeze(1).expand(-1, h, -1)
         return pe.unsqueeze(0)  # [1, dim, h, w]
 
     def forward(self, x, context):
@@ -333,17 +351,24 @@ class RelativeExposureEncoder(nn.Module):
         返回: [B, feat_dim, H, W] 相对曝光特征图
         """
         B, _, H, W = x.shape
-        local_feat = self.local_encoder(x)  # [B, feat_dim, H, W]
-        # 位置编码（插值到实际尺寸）
+        local_feat = self.local_encoder(x)  # [B, feat_dim, h', w']
+        # 修复：位置编码插值到local_feat的实际尺寸（而非原始输入尺寸），
+        # 避免H/W不是8倍数时尺寸不匹配
+        _, _, lh, lw = local_feat.shape
         pos = F.interpolate(
             self.pos_encoding.expand(B, -1, -1, -1),
-            size=(H, W), mode='bilinear', align_corners=False
-        )  # [B, feat_dim//2, H, W]
-        # 全局上下文广播到每个像素
-        context_map = context.unsqueeze(2).unsqueeze(3).expand(-1, -1, H, W)
+            size=(lh, lw), mode='bilinear', align_corners=False
+        )  # [B, feat_dim//2, lh, lw]
+        # 全局上下文广播到local_feat的空间尺寸
+        context_map = context.unsqueeze(2).unsqueeze(3).expand(-1, -1, lh, lw)
         # 融合：局部特征 + 位置 + 全局上下文
         combined = torch.cat([local_feat, pos, context_map], dim=1)
-        relative_feat = self.relative_head(combined)  # [B, feat_dim, H, W]
+        relative_feat = self.relative_head(combined)  # [B, feat_dim, lh, lw]
+        # 插值回原始输入尺寸，保证与主干网络特征图对齐
+        if lh != H or lw != W:
+            relative_feat = F.interpolate(
+                relative_feat, size=(H, W), mode='bilinear', align_corners=False
+            )
         return relative_feat
 
 
@@ -389,6 +414,13 @@ class ExposureAdaptiveDeformConv(nn.Module):
         self.bias = nn.Parameter(torch.Tensor(out_channels))
         nn.init.kaiming_normal_(self.weight)
         nn.init.zeros_(self.bias)
+        # 修复：偏移量预测最后一层必须零初始化，使初始偏移为0（可变形卷积退化为标准卷积）
+        nn.init.zeros_(self.offset_conv[-1].weight)
+        nn.init.zeros_(self.offset_conv[-1].bias)
+        # 调制掩码最后一层初始化为0.5（初始等权融合），确保训练起点稳定
+        # 注意：mask_conv最后一层是Sigmoid，所以这里初始化前一层使其输出接近0.5
+        nn.init.zeros_(self.mask_conv[-2].weight)
+        nn.init.zeros_(self.mask_conv[-2].bias)
 
     def forward(self, x, exposure_feat):
         """
@@ -439,10 +471,11 @@ class SEFConvBlock(nn.Module):
             exposure_feat_dim=exposure_feat_dim, padding=padding
         )
         # 门控融合：自动决定两条路径的权重
+        # 修复：使用3x3卷积保留空间信息，而非全局池化（原代码池化后expand导致门控空间均匀）
         self.gate = nn.Sequential(
-            nn.Conv2d(in_nc + exposure_feat_dim, max(in_nc // 4, 8), 1),
+            nn.Conv2d(in_nc + exposure_feat_dim, max(in_nc // 4, 8), 3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(max(in_nc // 4, 8), out_nc, 1),
+            nn.Conv2d(max(in_nc // 4, 8), out_nc, 3, padding=1),
             nn.Sigmoid()
         )
         self.pad = p
@@ -467,11 +500,8 @@ class SEFConvBlock(nn.Module):
         if self.act is not None:
             adapt_out = self.act(adapt_out)
 
-        # 门控融合
-        gate_input = torch.cat([
-            F.adaptive_avg_pool2d(x, 1).expand(-1, -1, x.size(2), x.size(3)),
-            exposure_feat
-        ], dim=1)
+        # 门控融合（修复：直接拼接x和exposure_feat，保留空间分辨率）
+        gate_input = torch.cat([x, exposure_feat], dim=1)
         g = self.gate(gate_input)  # [B, C_out, H, W]
         # g趋近1时偏向标准路径，趋近0时偏向自适应路径
         return g * std_out + (1 - g) * adapt_out
@@ -585,20 +615,25 @@ class MultiScaleExposureConsistencyLoss(nn.Module):
         super(MultiScaleExposureConsistencyLoss, self).__init__()
         self.vgg = vgg_net
         self.l1 = nn.L1Loss()
-        self.mse = nn.MSELoss()
         self.lambda_pixel = lambda_pixel
         self.lambda_percep = lambda_percep
         self.lambda_consistency = lambda_consistency
         self.lambda_exposure = lambda_exposure
 
     def exposure_consistency_loss(self, sr_feat, hr_feat, sr_exposure, hr_exposure):
-        """曝光一致性损失：同材质区域特征应一致，曝光差异大时降低约束权重"""
-        # 将曝光图下采样到VGG特征空间分辨率
+        """
+        曝光一致性损失：同材质区域特征应一致，曝光差异大时降低约束权重
+
+        修复：原代码用exp(-|diff|*5)，当diff很小时权重≈1，diff很大时权重≈0，
+        导致中等曝光差异区域（最需要监督的区域）权重过低。
+        改用sigmoid软阈值：diff<0.3时权重≈1，diff>0.7时权重≈0，中间平滑过渡。
+        """
         target_size = sr_feat.shape[2:]
         sr_exp_resized = F.adaptive_avg_pool2d(sr_exposure, target_size)
         hr_exp_resized = F.adaptive_avg_pool2d(hr_exposure, target_size)
         exposure_diff = torch.abs(sr_exp_resized - hr_exp_resized)
-        weight = torch.exp(-exposure_diff * 5)
+        # sigmoid软阈值替代exp衰减
+        weight = torch.sigmoid(5.0 - exposure_diff * 10)
         feat_diff = torch.abs(sr_feat - hr_feat)
         weighted_diff = feat_diff * weight
         return torch.mean(weighted_diff)
@@ -632,14 +667,18 @@ class MultiScaleExposureConsistencyLoss(nn.Module):
         """
         # 1. 像素级L1损失
         loss_pixel = self.l1(sr_output, hr)
-        # 2. 感知损失（多尺度VGG特征）
-        sr_vgg = self.vgg(sr_output)
-        hr_vgg = self.vgg(hr)
-        loss_percep = self.l1(sr_vgg, hr_vgg)
-        # 3. 曝光一致性损失（在VGG特征空间中）
-        loss_consistency = self.exposure_consistency_loss(
-            sr_vgg, hr_vgg, sr_exposure, hr_exposure
-        )
+        if self.vgg is not None:
+            # 2. 感知损失（多尺度VGG特征）
+            sr_vgg = self.vgg(sr_output)
+            hr_vgg = self.vgg(hr)
+            loss_percep = self.l1(sr_vgg, hr_vgg)
+            # 3. 曝光一致性损失（在VGG特征空间中）
+            loss_consistency = self.exposure_consistency_loss(
+                sr_vgg, hr_vgg, sr_exposure, hr_exposure
+            )
+        else:
+            loss_percep = torch.zeros((), device=sr_output.device)
+            loss_consistency = torch.zeros((), device=sr_output.device)
         # 4. 亮度分布损失
         loss_exposure = self.brightness_distribution_loss(sr_output, hr)
 

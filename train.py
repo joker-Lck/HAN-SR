@@ -38,22 +38,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, path):
-    torch.save({
-        'epoch': epoch + 1,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }, path)
+def save_checkpoint(model, optimizer, epoch, loss, path, arch_cfg=None):
+    from utils import save_checkpoint as _save
+    _save(model, path, optimizer=optimizer, epoch=epoch + 1, loss=loss, arch_cfg=arch_cfg)
 
 
 def load_checkpoint(model, optimizer, path, device):
     if os.path.exists(path):
-        ckpt = torch.load(path, map_location=device)
-        model.load_state_dict(ckpt['model_state_dict'], strict=False)
-        if optimizer is not None and 'optimizer_state_dict' in ckpt:
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        return ckpt.get('epoch', 0)
+        from utils import load_checkpoint as _load
+        state_dict, meta = _load(path, map_location=device)
+        model.load_state_dict(state_dict, strict=False)
+        if optimizer is not None and 'optimizer' in meta:
+            optimizer.load_state_dict(meta['optimizer'])
+        return meta.get('epoch', 0)
     return 0
 
 
@@ -75,10 +72,9 @@ ni = int(np.sqrt(batch_size))
 
 def train_stage1(generator, dataloader, sample_lr, device, cfg):
     """
-    阶段1: 曝光模块预训练
-    只训练 GlobalExposureStatistics 和 RelativeExposureEncoder
-    冻结 RRDB块和上采样
-    曝光模块预训练阶段
+    阶段1: 内容预热（base SR warmup）
+    全网络 L1 + 曝光增益引导，先建立基础超分能力；
+    不要冻结随机主干只训曝光分支（学不到曝光先验）。
     """
     save_dir = "samples/stage1_ginit"
     os.makedirs(save_dir, exist_ok=True)
@@ -86,21 +82,25 @@ def train_stage1(generator, dataloader, sample_lr, device, cfg):
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     logger.info("=" * 60)
-    logger.info("Stage 1: Exposure Module Pre-training (G init)")
+    logger.info("Stage 1: Content Warmup (full network, L1 + gain guidance)")
     logger.info("=" * 60)
 
-    # 冻结主网络参数
-    for name, param in generator.named_parameters():
-        if 'exposure_stats' not in name and 'relative_encoder' not in name:
-            param.requires_grad = False
-        else:
-            param.requires_grad = True
+    for param in generator.parameters():
+        param.requires_grad = True
 
-    trainable_params = [p for n, p in generator.named_parameters() if p.requires_grad]
+    trainable_params = [p for p in generator.parameters() if p.requires_grad]
     logger.info("Trainable params (stage1): {:,}".format(sum(p.numel() for p in trainable_params)))
 
-    optimizer = torch.optim.Adam(trainable_params, lr=cfg.TRAIN.stage1_lr,
-                                 betas=(cfg.TRAIN.beta1, cfg.TRAIN.beta2))
+    optimizer = torch.optim.Adam([
+        {'params': generator.exposure_stats.parameters(), 'lr': cfg.TRAIN.stage1_lr},
+        {'params': generator.relative_encoder.parameters(), 'lr': cfg.TRAIN.stage1_lr},
+        {'params': generator.conv_first.parameters(), 'lr': cfg.TRAIN.stage1_lr * 0.5},
+        {'params': generator.rrdb_blocks.parameters(), 'lr': cfg.TRAIN.stage1_lr * 0.5},
+        {'params': generator.LR_conv.parameters(), 'lr': cfg.TRAIN.stage1_lr * 0.5},
+        {'params': generator.upsample.parameters(), 'lr': cfg.TRAIN.stage1_lr * 0.5},
+        {'params': generator.HR_conv0.parameters(), 'lr': cfg.TRAIN.stage1_lr * 0.5},
+        {'params': generator.HR_conv1.parameters(), 'lr': cfg.TRAIN.stage1_lr * 0.5},
+    ], betas=(cfg.TRAIN.beta1, cfg.TRAIN.beta2))
 
     start_epoch = 0
     ckpt_path = os.path.join(checkpoint_dir, 'g_sefnet_stage1.pth')
@@ -123,9 +123,22 @@ def train_stage1(generator, dataloader, sample_lr, device, cfg):
 
             sr_output = generator(lr_imgs)
             loss = F.l1_loss(sr_output, hr_imgs)
+            # 修复：增加曝光增益引导损失
+            sr_lum = compute_luminance(sr_output)
+            hr_lum = compute_luminance(hr_imgs)
+            lr_lum = compute_luminance(lr_imgs)
+            lr_lum_hr = F.interpolate(lr_lum, size=hr_lum.shape[2:], mode='bilinear', align_corners=False)
+            safe_lr = lr_lum_hr.clamp(min=0.01)
+            target_gain = (hr_lum / safe_lr).clamp(0.1, 10.0)
+            sr_gain = (sr_lum / safe_lr).clamp(0.1, 10.0)
+            gain_mask = (torch.abs(target_gain - 1.0) > 0.1).float()
+            if gain_mask.sum() > 0:
+                loss = loss + 0.1 * F.l1_loss(sr_gain * gain_mask, target_gain * gain_mask)
 
             optimizer.zero_grad()
             loss.backward()
+            # 修复：梯度裁剪
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
             total_mse_loss += loss.item()
@@ -196,6 +209,9 @@ def train_stage2(generator, vgg_net, dataloader, sample_lr, device, cfg):
         {'params': generator.HR_conv0.parameters(), 'lr': cfg.TRAIN.stage2_lr * 0.5},
         {'params': generator.HR_conv1.parameters(), 'lr': cfg.TRAIN.stage2_lr * 0.5},
     ], betas=(cfg.TRAIN.beta1, cfg.TRAIN.beta2))
+    # 记录初始 lr，衰减时按比例缩放，避免“用当前 lr 比较基线”导致曝光组被误伤
+    for pg in optimizer.param_groups:
+        pg['initial_lr'] = pg['lr']
 
     start_epoch = 0
     ckpt_path = os.path.join(checkpoint_dir, 'g_sefnet_stage2.pth')
@@ -208,12 +224,12 @@ def train_stage2(generator, vgg_net, dataloader, sample_lr, device, cfg):
 
     generator.train()
     for epoch in range(start_epoch, cfg.TRAIN.stage2_epochs):
-        # 学习率衰减
+        # 学习率衰减（所有 param_group 按 initial_lr 同步缩放）
         if epoch != 0 and epoch % cfg.TRAIN.decay_every == 0:
-            new_lr = cfg.TRAIN.stage2_lr * (cfg.TRAIN.lr_decay ** (epoch // cfg.TRAIN.decay_every))
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = max(new_lr * 0.5, 1e-6) if param_group['lr'] < cfg.TRAIN.stage2_lr else new_lr
-            logger.info(" ** new learning rate: %f" % new_lr)
+            factor = cfg.TRAIN.lr_decay ** (epoch // cfg.TRAIN.decay_every)
+            for pg in optimizer.param_groups:
+                pg['lr'] = pg['initial_lr'] * factor
+            logger.info(" ** new learning rate factor: %f" % factor)
 
         epoch_time = time.time()
         total_loss, n_iter = 0, 0
@@ -228,9 +244,20 @@ def train_stage2(generator, vgg_net, dataloader, sample_lr, device, cfg):
             hr_lum = compute_luminance(hr_imgs)
 
             loss, loss_dict = criterion(sr_output, hr_imgs, sr_lum, hr_lum)
+            # 修复：增加曝光增益引导损失
+            lr_lum = compute_luminance(lr_imgs)
+            lr_lum_hr = F.interpolate(lr_lum, size=hr_lum.shape[2:], mode='bilinear', align_corners=False)
+            safe_lr = lr_lum_hr.clamp(min=0.01)
+            target_gain = (hr_lum / safe_lr).clamp(0.1, 10.0)
+            sr_gain = (sr_lum / safe_lr).clamp(0.1, 10.0)
+            gain_mask = (torch.abs(target_gain - 1.0) > 0.1).float()
+            if gain_mask.sum() > 0:
+                loss = loss + 0.1 * F.l1_loss(sr_gain * gain_mask, target_gain * gain_mask)
 
             optimizer.zero_grad()
             loss.backward()
+            # 修复：梯度裁剪
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item()
@@ -292,6 +319,10 @@ def train_stage3(generator, discriminator, vgg_net, dataloader, sample_lr, devic
                                    betas=(cfg.TRAIN.beta1, cfg.TRAIN.beta2))
     d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=cfg.TRAIN.stage3_lr,
                                    betas=(cfg.TRAIN.beta1, cfg.TRAIN.beta2))
+    for pg in g_optimizer.param_groups:
+        pg['initial_lr'] = pg['lr']
+    for pg in d_optimizer.param_groups:
+        pg['initial_lr'] = pg['lr']
 
     start_epoch = 0
     g_ckpt = os.path.join(checkpoint_dir, 'g_sefnet_stage3.pth')
@@ -307,12 +338,12 @@ def train_stage3(generator, discriminator, vgg_net, dataloader, sample_lr, devic
     for epoch in range(start_epoch, cfg.TRAIN.stage3_epochs):
         # 学习率衰减
         if epoch != 0 and epoch % cfg.TRAIN.decay_every == 0:
-            new_lr = cfg.TRAIN.stage3_lr * (cfg.TRAIN.lr_decay ** (epoch // cfg.TRAIN.decay_every))
+            factor = cfg.TRAIN.lr_decay ** (epoch // cfg.TRAIN.decay_every)
             for pg in g_optimizer.param_groups:
-                pg['lr'] = new_lr
+                pg['lr'] = pg['initial_lr'] * factor
             for pg in d_optimizer.param_groups:
-                pg['lr'] = new_lr
-            logger.info(" ** new learning rate: %f" % new_lr)
+                pg['lr'] = pg['initial_lr'] * factor
+            logger.info(" ** new learning rate factor: %f" % factor)
 
         epoch_time = time.time()
         total_d_loss, total_g_loss, n_iter = 0, 0, 0
@@ -330,6 +361,8 @@ def train_stage3(generator, discriminator, vgg_net, dataloader, sample_lr, devic
 
             d_optimizer.zero_grad()
             d_loss.backward()
+            # 修复：判别器梯度裁剪
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
             d_optimizer.step()
 
             # ===== 训练生成器 =====
@@ -340,11 +373,22 @@ def train_stage3(generator, discriminator, vgg_net, dataloader, sample_lr, devic
             sr_lum = compute_luminance(sr_output)
             hr_lum = compute_luminance(hr_imgs)
             content_loss, loss_dict = criterion(sr_output, hr_imgs, sr_lum, hr_lum)
+            # 修复：增加曝光增益引导损失
+            lr_lum = compute_luminance(lr_imgs)
+            lr_lum_hr = F.interpolate(lr_lum, size=hr_lum.shape[2:], mode='bilinear', align_corners=False)
+            safe_lr = lr_lum_hr.clamp(min=0.01)
+            target_gain = (hr_lum / safe_lr).clamp(0.1, 10.0)
+            sr_gain = (sr_lum / safe_lr).clamp(0.1, 10.0)
+            gain_mask = (torch.abs(target_gain - 1.0) > 0.1).float()
+            if gain_mask.sum() > 0:
+                content_loss = content_loss + 0.1 * F.l1_loss(sr_gain * gain_mask, target_gain * gain_mask)
             gan_loss = relativistic_generator_loss(logits_real, logits_fake)
             g_loss = content_loss + cfg.TRAIN.lambda_gan * gan_loss
 
             g_optimizer.zero_grad()
             g_loss.backward()
+            # 修复：生成器梯度裁剪
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
             g_optimizer.step()
 
             total_d_loss += d_loss.item()
@@ -452,7 +496,8 @@ def main():
     dataset = SRDataset(
         hr_path=args.hr_path, lr_path=args.lr_path,
         crop_size=args.crop_size, scale_factor=args.scale,
-        augment=True, repeat=10
+        augment=True, repeat=10,
+        exposure_synth=(args.lr_path is None),
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, pin_memory=True, drop_last=True)
@@ -471,9 +516,17 @@ def main():
     discriminator = arch.Discriminator_VGG(in_nc=3, nf=64)
     logger.info("Discriminator params: {:,}".format(sum(p.numel() for p in discriminator.parameters())))
 
-    # VGG感知损失
-    vgg_net = arch.VGGFeatureExtractor(feature_layer=34).to(device)
-    vgg_net.eval()
+    # VGG 仅 stage2/3 需要
+    need_vgg = args.stage in ('2', '3', 'all')
+    vgg_net = None
+    if need_vgg:
+        vgg_net = arch.VGGFeatureExtractor(
+            feature_layer=34,
+            weights_path=os.path.join('weights', 'vgg19-dcbb9e9d.pth'),
+        ).to(device)
+        vgg_net.eval()
+    else:
+        logger.info("Stage1 only: skip VGG load (offline-friendly)")
 
     # 固定样张输入（训练期间监控用）
     from PIL import Image
@@ -509,14 +562,21 @@ def main():
     if args.stage == '3' or args.stage == 'all':
         train_stage3(generator, discriminator, vgg_net, dataloader, sample_lr, device, config)
 
-    # 保存最终模型
+    # 保存最终模型（统一格式，含 arch 元信息）
     final_path = os.path.join('checkpoint', 'SEFNet_G_final.pth')
-    torch.save(generator.state_dict(), final_path)
+    from utils import save_checkpoint as _save_final
+    _save_final(generator, final_path, epoch=0,
+                arch_cfg={'nf': 64, 'nb': config.TRAIN.nb, 'gc': 32,
+                          'upscale': args.scale, 'context_dim': config.TRAIN.context_dim,
+                          'exposure_feat_dim': config.TRAIN.exposure_feat_dim,
+                          'upsample_mode': 'pixelshuffle'})
     logger.info("Final model saved: %s" % final_path)
 
     # 评估
-    if args.valid_hr_path and os.path.isdir(args.valid_hr_path):
+    if args.valid_hr_path and os.path.isdir(args.valid_hr_path) and args.valid_lr_path and os.path.isdir(args.valid_lr_path):
         evaluate(generator, args.valid_hr_path, args.valid_lr_path, device, config)
+    else:
+        logger.info("Skip evaluate: need both --valid_hr_path and --valid_lr_path")
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 import block as B
 
 
@@ -61,39 +62,38 @@ class RRDB_Net(nn.Module):
 
 
 class Discriminator_VGG(nn.Module):
+    """
+    判别器：使用谱归一化(spectral_norm)替代BatchNorm
+    原因：RaGAN的relativistic loss依赖判别器输出的绝对值做mean，
+    BN的batch-dependent统计量会导致训练不稳定。谱归一化约束Lipschitz常数，
+    不依赖batch统计，更适合RaGAN。
+    """
     def __init__(self, in_nc, nf):
         super(Discriminator_VGG, self).__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(in_nc, nf, 3, 1, 1),
+            spectral_norm(nn.Conv2d(in_nc, nf, 3, 1, 1)),
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(nf, nf, 3, 2, 1),
-            nn.BatchNorm2d(nf),
+            spectral_norm(nn.Conv2d(nf, nf, 3, 2, 1)),
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(nf, nf*2, 3, 1, 1),
-            nn.BatchNorm2d(nf*2),
+            spectral_norm(nn.Conv2d(nf, nf*2, 3, 1, 1)),
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(nf*2, nf*2, 3, 2, 1),
-            nn.BatchNorm2d(nf*2),
+            spectral_norm(nn.Conv2d(nf*2, nf*2, 3, 2, 1)),
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(nf*2, nf*4, 3, 1, 1),
-            nn.BatchNorm2d(nf*4),
+            spectral_norm(nn.Conv2d(nf*2, nf*4, 3, 1, 1)),
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(nf*4, nf*4, 3, 2, 1),
-            nn.BatchNorm2d(nf*4),
+            spectral_norm(nn.Conv2d(nf*4, nf*4, 3, 2, 1)),
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(nf*4, nf*8, 3, 1, 1),
-            nn.BatchNorm2d(nf*8),
+            spectral_norm(nn.Conv2d(nf*4, nf*8, 3, 1, 1)),
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(nf*8, nf*8, 3, 2, 1),
-            nn.BatchNorm2d(nf*8),
+            spectral_norm(nn.Conv2d(nf*8, nf*8, 3, 2, 1)),
             nn.LeakyReLU(0.2, True),
         )
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(nf*8, 1024),
+            spectral_norm(nn.Linear(nf*8, 1024)),
             nn.LeakyReLU(0.2, True),
-            nn.Linear(1024, 1),
+            spectral_norm(nn.Linear(1024, 1)),
         )
 
     def forward(self, x):
@@ -103,13 +103,48 @@ class Discriminator_VGG(nn.Module):
 
 
 class VGGFeatureExtractor(nn.Module):
-    def __init__(self, feature_layer=34):
+    """
+    VGG19 特征提取器（感知损失用）。
+
+    权重获取顺序:
+      1. 显式 weights_path（本地文件）
+      2. torch hub 缓存 / 在线下载 ImageNet 预训练
+      3. 失败时退回随机初始化（仅警告，不阻塞训练；感知损失会变弱）
+    """
+    def __init__(self, feature_layer=34, pretrained=True, weights_path=None):
         super(VGGFeatureExtractor, self).__init__()
+        import os
+        import warnings
         from torchvision.models import vgg19, VGG19_Weights
-        try:
-            vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
-        except TypeError:
-            vgg = vgg19(pretrained=True)
+
+        vgg = None
+        last_err = None
+        if weights_path and os.path.isfile(weights_path):
+            try:
+                vgg = vgg19(weights=None)
+                state = torch.load(weights_path, map_location='cpu', weights_only=True)
+                vgg.load_state_dict(state)
+            except Exception as e:
+                last_err = e
+                vgg = None
+        if vgg is None and pretrained:
+            try:
+                vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
+            except TypeError:
+                try:
+                    vgg = vgg19(pretrained=True)
+                except Exception as e:
+                    last_err = e
+            except Exception as e:
+                last_err = e
+        if vgg is None:
+            warnings.warn(
+                'VGG19 pretrained weights unavailable (%s); using random init. '
+                'Perceptual/exposure-consistency losses will be weaker. '
+                'Place weights at weights/vgg19-dcbb9e9d.pth to enable them.' % last_err
+            )
+            vgg = vgg19(weights=None)
+
         self.features = nn.Sequential(*list(vgg.features.children())[:feature_layer])
         for param in self.features.parameters():
             param.requires_grad = False
