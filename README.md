@@ -49,7 +49,27 @@ Stage 1 可完全离线运行。
 | `batch_size` | 8–16 |
 | `patch_size` | 128（可试 192） |
 | `nb` | 16（训练默认） |
-| 预估显存 | batch=8, patch=128, nb=16 约 6–8 GB；batch=16 约 12–14 GB |
+| `--amp auto` | 默认开，bf16（5080）/ fp16 |
+| `--grad_ckpt` | 默认开，RRDB 激活重算，省显存 |
+| `--accum_steps` | 需要大等效 batch 时设 2–4 |
+
+预估显存（nb=16, patch=128；本地实测相对比例，5080 可按此放大 batch）：
+
+| 设置 | 相对峰值 | 说明 |
+|------|----------|------|
+| fp32 + 全激活 | 1.0× | 基线 |
+| AMP (bf16/fp16) | ~0.74× | 约省 26% |
+| AMP + `--grad_ckpt` | **~0.37×** | 合计约省 63% |
+
+参数/优化器固定占用约 1–1.5GB（63M + Adam），开启上述选项后 **batch=16** 在 16GB 上通常很宽裕；Stage3 峰值更高（G+D+VGG），建议 `batch_size=8–12`。
+
+显存紧张时：
+
+```bash
+python train_sefnet.py --hr_dir data/DIV2K_train_HR \
+  --batch_size 8 --amp auto --grad_ckpt --accum_steps 2
+# 仍不够：--batch_size 4 --patch_size 96
+```
 
 ## 数据准备
 
@@ -80,6 +100,15 @@ python train_sefnet.py --hr_dir data/DIV2K_train_HR --stage 3
 - 保存样张到 `samples/`
 - 保存checkpoint到 `checkpoint/`（统一格式，含 arch 元信息）
 - 写入训练日志到 `log/`
+
+显存相关参数：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--amp` | `auto` | 混合精度（bf16/fp16） |
+| `--grad_ckpt` | 开 | RRDB 梯度检查点（`--no_grad_ckpt` 关闭） |
+| `--accum_steps` | 1 | 梯度累积，等效 batch = batch_size × accum |
+| `--batch_size` | 8 | 按 5080 16GB 默认 |
 
 ## 推理
 

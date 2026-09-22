@@ -16,6 +16,7 @@ ARCH_DEFAULTS = {
     'norm_type': None,
     'act_type': 'leakyrelu',
     'mode': 'CNA',
+    'grad_checkpoint': False,
 }
 
 
@@ -29,6 +30,7 @@ def build_generator(arch_cfg=None):
         upsample_mode=cfg['upsample_mode'],
         context_dim=cfg['context_dim'],
         exposure_feat_dim=cfg['exposure_feat_dim'],
+        grad_checkpoint=cfg.get('grad_checkpoint', False),
     )
 
 
@@ -62,6 +64,60 @@ def load_checkpoint(path, map_location='cpu'):
     if isinstance(ckpt, dict) and len(ckpt) > 0 and all(hasattr(v, 'shape') for v in ckpt.values()):
         return ckpt, {'state_dict': ckpt, 'arch': dict(ARCH_DEFAULTS)}
     raise ValueError('Unrecognized checkpoint format: %r' % (type(ckpt),))
+
+
+class AmpHelper:
+    """
+    混合精度助手（面向 16GB 卡）。
+    mode: 'auto' | 'on' | 'off'
+      auto: CUDA 优先 bf16，否则 fp16；CPU 关闭
+    fp16 使用 GradScaler；bf16 不用 scaler（动态范围同 fp32）。
+    """
+
+    def __init__(self, device, mode='auto'):
+        self.device = device
+        use_cuda = device.type == 'cuda'
+        if mode == 'off' or not use_cuda:
+            self.enabled = False
+            self.dtype = torch.float32
+            self.scaler = None
+            self.mode_name = 'off'
+            return
+        self.enabled = True
+        if mode == 'on' or mode == 'auto':
+            bf16_ok = use_cuda and torch.cuda.is_bf16_supported()
+            self.dtype = torch.bfloat16 if bf16_ok else torch.float16
+        else:
+            self.dtype = torch.float32
+            self.enabled = False
+        if self.enabled and self.dtype == torch.float16:
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
+        self.mode_name = 'bf16' if self.dtype == torch.bfloat16 else 'fp16'
+
+    def autocast(self):
+        return torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.enabled)
+
+    def backward(self, loss, accum_scale=1.0):
+        loss = loss / accum_scale
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+    def step(self, optimizer, params=None, max_norm=1.0):
+        if self.scaler is not None:
+            if params is not None and max_norm is not None:
+                self.scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params, max_norm)
+            self.scaler.step(optimizer)
+            self.scaler.update()
+        else:
+            if params is not None and max_norm is not None:
+                torch.nn.utils.clip_grad_norm_(params, max_norm)
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
 
 def get_imgs_fn(file_name, path):

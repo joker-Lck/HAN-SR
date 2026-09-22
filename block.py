@@ -668,9 +668,10 @@ class MultiScaleExposureConsistencyLoss(nn.Module):
         # 1. 像素级L1损失
         loss_pixel = self.l1(sr_output, hr)
         if self.vgg is not None:
-            # 2. 感知损失（多尺度VGG特征）
+            # 2. 感知损失：GT 无梯度，避免为 HR 存 VGG 激活
             sr_vgg = self.vgg(sr_output)
-            hr_vgg = self.vgg(hr)
+            with torch.no_grad():
+                hr_vgg = self.vgg(hr)
             loss_percep = self.l1(sr_vgg, hr_vgg)
             # 3. 曝光一致性损失（在VGG特征空间中）
             loss_consistency = self.exposure_consistency_loss(

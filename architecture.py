@@ -8,8 +8,9 @@ import block as B
 class RRDB_Net(nn.Module):
     def __init__(self, in_nc, out_nc, nf, nb, gc=32, upscale=4, norm_type=None, act_type='leakyrelu', \
             mode='CNA', res_scale=1, upsample_mode='upconv', \
-            context_dim=64, exposure_feat_dim=32):
+            context_dim=64, exposure_feat_dim=32, grad_checkpoint=False):
         super(RRDB_Net, self).__init__()
+        self.grad_checkpoint = grad_checkpoint
         n_upscale = int(math.log(upscale, 2))
         if upscale == 3:
             n_upscale = 1
@@ -45,13 +46,19 @@ class RRDB_Net(nn.Module):
         self.HR_conv1 = HR_conv1
 
     def forward(self, x):
+        from torch.utils.checkpoint import checkpoint
+
         context, global_feat = self.exposure_stats(x)
         exposure_feat = self.relative_encoder(x, context)
 
         feat = self.conv_first(x)
         body_feat = feat
+        use_ckpt = self.grad_checkpoint and self.training and torch.is_grad_enabled()
         for block in self.rrdb_blocks:
-            body_feat = block(body_feat, exposure_feat)
+            if use_ckpt:
+                body_feat = checkpoint(block, body_feat, exposure_feat, use_reentrant=False)
+            else:
+                body_feat = block(body_feat, exposure_feat)
         body_feat = self.LR_conv(body_feat)
         feat = feat + body_feat
 

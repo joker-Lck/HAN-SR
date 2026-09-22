@@ -43,7 +43,7 @@ from torchvision.utils import save_image
 import architecture as arch
 import block as B
 from config import config
-from utils import save_checkpoint, load_checkpoint, ARCH_DEFAULTS
+from utils import save_checkpoint, load_checkpoint, ARCH_DEFAULTS, AmpHelper
 
 # ===== 日志 =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -389,7 +389,9 @@ class SEFNetLoss(nn.Module):
 
         if self.vgg is not None:
             sr_vgg = self.vgg(sr)
-            hr_vgg = self.vgg(hr)
+            # GT 固定，no_grad 避免为 HR 存 VGG 激活（16GB 上收益明显）
+            with torch.no_grad():
+                hr_vgg = self.vgg(hr)
             loss_per = self.l1(sr_vgg, hr_vgg)
             loss_con = self._exposure_consistency(sr_vgg, hr_vgg, sr_lum, hr_lum)
         else:
@@ -473,6 +475,23 @@ def save_samples(model, lr_imgs, save_path, device):
 # 第五部分: 三阶段训练
 # ====================================================================
 
+def _amp(args, device):
+    return AmpHelper(device, mode=args.amp)
+
+
+def _maybe_step(optimizer, params, amp, step_i, accum):
+    """累积 accum 步后再 optimizer.step()，等效放大 batch。"""
+    if (step_i + 1) % accum != 0:
+        return False
+    amp.step(optimizer, params=params, max_norm=1.0)
+    return True
+
+
+def _flush_step(optimizer, params, amp):
+    """epoch 末冲刷未满 accum 的残留梯度。"""
+    amp.step(optimizer, params=params, max_norm=1.0)
+
+
 def stage1_pretrain(G, dataloader, sample_lr, device, cfg, args):
     """
     阶段1: 内容预热（base SR warmup）
@@ -485,10 +504,13 @@ def stage1_pretrain(G, dataloader, sample_lr, device, cfg, args):
     ckpt_dir = 'checkpoint'
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
+    amp = _amp(args, device)
+    accum = max(1, args.accum_steps)
 
     logger.info('=' * 60)
     logger.info('Stage 1: Content Warmup (full network, L1 + gain guidance)')
     logger.info('=' * 60)
+    logger.info(f'AMP: {amp.mode_name}  grad_ckpt: {args.grad_ckpt}  accum_steps: {accum}')
 
     for p in G.parameters():
         p.requires_grad = True
@@ -507,6 +529,7 @@ def stage1_pretrain(G, dataloader, sample_lr, device, cfg, args):
         {'params': G.HR_conv0.parameters(), 'lr': 5e-5},
         {'params': G.HR_conv1.parameters(), 'lr': 5e-5},
     ])
+    optimizer.zero_grad(set_to_none=True)
     ckpt_path = os.path.join(ckpt_dir, 'g_stage1.pth')
     start_ep = load_ckpt(G, optimizer, ckpt_path, device)
 
@@ -514,46 +537,47 @@ def stage1_pretrain(G, dataloader, sample_lr, device, cfg, args):
     for ep in range(start_ep, args.stage1_epochs):
         ep_loss, n = 0, 0
         t0 = time.time()
-        for lr_imgs, hr_imgs, gain_map, exp_type in dataloader:
-            lr_imgs = lr_imgs.to(device)
-            hr_imgs = hr_imgs.to(device)
-            gain_map = gain_map.to(device)
-            exp_type = exp_type.to(device)
+        for step_i, (lr_imgs, hr_imgs, gain_map, exp_type) in enumerate(dataloader):
+            lr_imgs = lr_imgs.to(device, non_blocking=True)
+            hr_imgs = hr_imgs.to(device, non_blocking=True)
+            gain_map = gain_map.to(device, non_blocking=True)
+            exp_type = exp_type.to(device, non_blocking=True)
 
-            sr = G(lr_imgs)
-            loss = F.l1_loss(sr, hr_imgs)
+            with amp.autocast():
+                sr = G(lr_imgs)
+                loss = F.l1_loss(sr, hr_imgs)
 
-            # 曝光增益引导
-            sr_lum = 0.299 * sr[:, 0:1] + 0.587 * sr[:, 1:2] + 0.114 * sr[:, 2:3]
-            hr_lum = 0.299 * hr_imgs[:, 0:1] + 0.587 * hr_imgs[:, 1:2] + 0.114 * hr_imgs[:, 2:3]
-            lr_lum = 0.299 * lr_imgs[:, 0:1] + 0.587 * lr_imgs[:, 1:2] + 0.114 * lr_imgs[:, 2:3]
-            lr_lum_hr = F.interpolate(lr_lum, size=hr_lum.shape[2:], mode='bilinear', align_corners=False)
-            safe_lr = lr_lum_hr.clamp(min=0.01)
-            target_gain = (hr_lum / safe_lr).clamp(0.1, 10.0)
-            sr_gain = (sr_lum / safe_lr).clamp(0.1, 10.0)
-            gain_mask = (torch.abs(target_gain - 1.0) > 0.1).float()
-            if gain_mask.sum() > 0:
-                loss = loss + 0.1 * F.l1_loss(sr_gain * gain_mask, target_gain * gain_mask)
+                # 曝光增益引导
+                sr_lum = 0.299 * sr[:, 0:1] + 0.587 * sr[:, 1:2] + 0.114 * sr[:, 2:3]
+                hr_lum = 0.299 * hr_imgs[:, 0:1] + 0.587 * hr_imgs[:, 1:2] + 0.114 * hr_imgs[:, 2:3]
+                lr_lum = 0.299 * lr_imgs[:, 0:1] + 0.587 * lr_imgs[:, 1:2] + 0.114 * lr_imgs[:, 2:3]
+                lr_lum_hr = F.interpolate(lr_lum, size=hr_lum.shape[2:], mode='bilinear', align_corners=False)
+                safe_lr = lr_lum_hr.clamp(min=0.01)
+                target_gain = (hr_lum / safe_lr).clamp(0.1, 10.0)
+                sr_gain = (sr_lum / safe_lr).clamp(0.1, 10.0)
+                gain_mask = (torch.abs(target_gain - 1.0) > 0.1).float()
+                if gain_mask.sum() > 0:
+                    loss = loss + 0.1 * F.l1_loss(sr_gain * gain_mask, target_gain * gain_mask)
 
-            # 曝光校准损失（向量化，不破坏计算图）
-            sr_mean = sr_lum.mean(dim=(2, 3))  # [B, 1]
-            hr_mean = hr_lum.mean(dim=(2, 3))
-            sr_std = sr_lum.std(dim=(2, 3))
-            hr_std = hr_lum.std(dim=(2, 3))
-            diff_mean = torch.abs(sr_mean - hr_mean)
-            diff_std = torch.abs(sr_std - hr_std)
-            t = exp_type.float().unsqueeze(1)
-            w_mean = torch.where(t == 0, 0.5, torch.where(t == 1, 2.0, 1.0))
-            w_std = torch.where(t == 0, 2.0, torch.where(t == 1, 0.5, 1.0))
-            loss_cal = (w_mean * diff_mean + w_std * diff_std).mean()
-            loss = loss + 0.2 * loss_cal
+                # 曝光校准损失（向量化，不破坏计算图）
+                sr_mean = sr_lum.mean(dim=(2, 3))
+                hr_mean = hr_lum.mean(dim=(2, 3))
+                sr_std = sr_lum.std(dim=(2, 3))
+                hr_std = hr_lum.std(dim=(2, 3))
+                diff_mean = torch.abs(sr_mean - hr_mean)
+                diff_std = torch.abs(sr_std - hr_std)
+                t = exp_type.float().unsqueeze(1)
+                w_mean = torch.where(t == 0, 0.5, torch.where(t == 1, 2.0, 1.0))
+                w_std = torch.where(t == 0, 2.0, torch.where(t == 1, 0.5, 1.0))
+                loss_cal = (w_mean * diff_mean + w_std * diff_std).mean()
+                loss = loss + 0.2 * loss_cal
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-            optimizer.step()
+            amp.backward(loss, accum_scale=accum)
+            _maybe_step(optimizer, trainable, amp, step_i, accum)
             ep_loss += loss.item()
             n += 1
+        if n % accum != 0:
+            _flush_step(optimizer, trainable, amp)
 
         avg = ep_loss / max(n, 1)
         logger.info(f'[Stage1] Epoch [{ep}/{args.stage1_epochs}] '
@@ -564,8 +588,11 @@ def stage1_pretrain(G, dataloader, sample_lr, device, cfg, args):
             save_ckpt(G, optimizer, ep, avg, ckpt_path,
                       arch_cfg={'nf': args.nf, 'nb': args.nb, 'gc': args.gc,
                                 'upscale': args.scale, 'context_dim': 64,
-                                'exposure_feat_dim': 32, 'upsample_mode': 'pixelshuffle'})
+                                'exposure_feat_dim': 32, 'upsample_mode': 'pixelshuffle',
+                                'grad_checkpoint': args.grad_ckpt})
             logger.info(f'[*] saved checkpoint + samples')
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
 
 
 def stage2_joint(G, vgg_net, dataloader, sample_lr, device, cfg, args):
@@ -612,6 +639,10 @@ def stage2_joint(G, vgg_net, dataloader, sample_lr, device, cfg, args):
 
     ckpt_path = os.path.join(ckpt_dir, 'g_stage2.pth')
     start_ep = load_ckpt(G, optimizer, ckpt_path, device)
+    optimizer.zero_grad(set_to_none=True)
+    amp = _amp(args, device)
+    accum = max(1, args.accum_steps)
+    logger.info(f'AMP: {amp.mode_name}  grad_ckpt: {args.grad_ckpt}  accum_steps: {accum}')
 
     G.train()
     for ep in range(start_ep, args.stage2_epochs):
@@ -622,21 +653,22 @@ def stage2_joint(G, vgg_net, dataloader, sample_lr, device, cfg, args):
 
         ep_loss, n = 0, 0
         t0 = time.time()
-        for lr_imgs, hr_imgs, gain_map, exp_type in dataloader:
-            lr_imgs = lr_imgs.to(device)
-            hr_imgs = hr_imgs.to(device)
-            gain_map = gain_map.to(device)
-            exp_type = exp_type.to(device)
+        for step_i, (lr_imgs, hr_imgs, gain_map, exp_type) in enumerate(dataloader):
+            lr_imgs = lr_imgs.to(device, non_blocking=True)
+            hr_imgs = hr_imgs.to(device, non_blocking=True)
+            gain_map = gain_map.to(device, non_blocking=True)
+            exp_type = exp_type.to(device, non_blocking=True)
 
-            sr = G(lr_imgs)
-            loss, ld = criterion(sr, hr_imgs, lr=lr_imgs,
-                                 gain_map=gain_map, exp_type=exp_type)
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
-            optimizer.step()
+            with amp.autocast():
+                sr = G(lr_imgs)
+                loss, ld = criterion(sr, hr_imgs, lr=lr_imgs,
+                                     gain_map=gain_map, exp_type=exp_type)
+            amp.backward(loss, accum_scale=accum)
+            _maybe_step(optimizer, G.parameters(), amp, step_i, accum)
             ep_loss += loss.item()
             n += 1
+        if n % accum != 0:
+            _flush_step(optimizer, G.parameters(), amp)
 
         avg = ep_loss / max(n, 1)
         logger.info(f'[Stage2] Epoch [{ep}/{args.stage2_epochs}] '
@@ -647,8 +679,11 @@ def stage2_joint(G, vgg_net, dataloader, sample_lr, device, cfg, args):
             save_ckpt(G, optimizer, ep, avg, ckpt_path,
                       arch_cfg={'nf': args.nf, 'nb': args.nb, 'gc': args.gc,
                                 'upscale': args.scale, 'context_dim': 64,
-                                'exposure_feat_dim': 32, 'upsample_mode': 'pixelshuffle'})
+                                'exposure_feat_dim': 32, 'upsample_mode': 'pixelshuffle',
+                                'grad_checkpoint': args.grad_ckpt})
             logger.info(f'[*] saved checkpoint + samples')
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
 
 
 def stage3_gan(G, D, vgg_net, dataloader, sample_lr, device, cfg, args):
@@ -685,6 +720,11 @@ def stage3_gan(G, D, vgg_net, dataloader, sample_lr, device, cfg, args):
     lr_gan = cfg.TRAIN.stage3_lr if hasattr(cfg.TRAIN, 'stage3_lr') else 1e-4
     g_opt = torch.optim.Adam(G.parameters(), lr=lr_gan)
     d_opt = torch.optim.Adam(D.parameters(), lr=lr_gan)
+    g_opt.zero_grad(set_to_none=True)
+    d_opt.zero_grad(set_to_none=True)
+    amp = _amp(args, device)
+    accum = max(1, args.accum_steps)
+    logger.info(f'AMP: {amp.mode_name}  grad_ckpt: {args.grad_ckpt}  accum_steps: {accum}')
 
     g_ckpt = os.path.join(ckpt_dir, 'g_stage3.pth')
     d_ckpt = os.path.join(ckpt_dir, 'd_stage3.pth')
@@ -698,34 +738,38 @@ def stage3_gan(G, D, vgg_net, dataloader, sample_lr, device, cfg, args):
 
         ep_g, ep_d, n = 0, 0, 0
         t0 = time.time()
-        for lr_imgs, hr_imgs, gain_map, exp_type in dataloader:
-            lr_imgs = lr_imgs.to(device)
-            hr_imgs = hr_imgs.to(device)
-            gain_map = gain_map.to(device)
-            exp_type = exp_type.to(device)
+        for step_i, (lr_imgs, hr_imgs, gain_map, exp_type) in enumerate(dataloader):
+            lr_imgs = lr_imgs.to(device, non_blocking=True)
+            hr_imgs = hr_imgs.to(device, non_blocking=True)
+            gain_map = gain_map.to(device, non_blocking=True)
+            exp_type = exp_type.to(device, non_blocking=True)
 
-            # update D
-            sr_det = G(lr_imgs).detach()
-            d_loss = ra_d_loss(D(hr_imgs), D(sr_det))
-            d_opt.zero_grad()
-            d_loss.backward()
-            torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=1.0)
-            d_opt.step()
+            # update D（G 推理 no_grad：训 D 时不需要 G 的激活图）
+            with torch.no_grad(), amp.autocast():
+                sr_det = G(lr_imgs)
+            with amp.autocast():
+                d_loss = ra_d_loss(D(hr_imgs), D(sr_det))
+            amp.backward(d_loss, accum_scale=accum)
+            _maybe_step(d_opt, D.parameters(), amp, step_i, accum)
 
-            # update G
-            sr = G(lr_imgs)
-            content, ld = criterion(sr, hr_imgs, lr=lr_imgs,
-                                    gain_map=gain_map, exp_type=exp_type)
-            gan = ra_g_loss(D(hr_imgs), D(sr))
-            g_loss = content + cfg.TRAIN.lambda_gan * gan
-            g_opt.zero_grad()
-            g_loss.backward()
-            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
-            g_opt.step()
+            # update G（D(hr) 仅作 RaGAN 常数基线，no_grad 省一整条 D 前向）
+            with torch.no_grad(), amp.autocast():
+                logits_real = D(hr_imgs)
+            with amp.autocast():
+                sr = G(lr_imgs)
+                content, ld = criterion(sr, hr_imgs, lr=lr_imgs,
+                                        gain_map=gain_map, exp_type=exp_type)
+                gan = ra_g_loss(logits_real, D(sr))
+                g_loss = content + cfg.TRAIN.lambda_gan * gan
+            amp.backward(g_loss, accum_scale=accum)
+            _maybe_step(g_opt, G.parameters(), amp, step_i, accum)
 
             ep_g += g_loss.item()
             ep_d += d_loss.item()
             n += 1
+        if n % accum != 0:
+            _flush_step(d_opt, D.parameters(), amp)
+            _flush_step(g_opt, G.parameters(), amp)
 
         logger.info(f'[Stage3] Epoch [{ep}/{args.stage3_epochs}] '
                      f'time: {time.time()-t0:.1f}s  G: {ep_g/n:.6f}  D: {ep_d/n:.6f}')
@@ -735,9 +779,12 @@ def stage3_gan(G, D, vgg_net, dataloader, sample_lr, device, cfg, args):
             save_ckpt(G, g_opt, ep, ep_g / n, g_ckpt,
                       arch_cfg={'nf': args.nf, 'nb': args.nb, 'gc': args.gc,
                                 'upscale': args.scale, 'context_dim': 64,
-                                'exposure_feat_dim': 32, 'upsample_mode': 'pixelshuffle'})
+                                'exposure_feat_dim': 32, 'upsample_mode': 'pixelshuffle',
+                                'grad_checkpoint': args.grad_ckpt})
             save_ckpt(D, d_opt, ep, ep_d / n, d_ckpt)
             logger.info(f'[*] saved checkpoint + samples')
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
 
 
 # ====================================================================
@@ -750,8 +797,9 @@ def main():
                         help='HR image directory (any folder of images)')
     parser.add_argument('--patch_size', type=int, default=128)
     parser.add_argument('--scale', type=int, default=4)
-    parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--num_workers', type=int, default=0)
+    # 5080 16GB 默认配置
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--stage1_epochs', type=int, default=50)
     parser.add_argument('--stage2_epochs', type=int, default=200)
     parser.add_argument('--stage3_epochs', type=int, default=100)
@@ -761,6 +809,15 @@ def main():
     parser.add_argument('--nb', type=int, default=16, help='number of RRDB blocks')
     parser.add_argument('--gc', type=int, default=32)
     parser.add_argument('--device', type=str, default='auto')
+    # 显存优化（16GB）
+    parser.add_argument('--amp', type=str, default='auto', choices=['auto', 'on', 'off'],
+                        help='mixed precision: auto=bf16/fp16, on=force, off=fp32')
+    parser.add_argument('--accum_steps', type=int, default=1,
+                        help='gradient accumulation steps (effective batch = batch_size * accum)')
+    parser.add_argument('--grad_ckpt', action='store_true', default=True,
+                        help='gradient checkpointing on RRDB blocks (lower activation memory)')
+    parser.add_argument('--no_grad_ckpt', dest='grad_ckpt', action='store_false',
+                        help='disable gradient checkpointing')
     args = parser.parse_args()
 
     # 设备
@@ -768,6 +825,8 @@ def main():
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(args.device)
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
     logger.info(f'Device: {device}')
 
     # 目录
@@ -798,7 +857,8 @@ def main():
     G = arch.RRDB_Net(3, 3, args.nf, args.nb, gc=args.gc, upscale=args.scale,
                       norm_type=None, act_type='leakyrelu', mode='CNA',
                       upsample_mode='pixelshuffle',
-                      context_dim=64, exposure_feat_dim=32).to(device)
+                      context_dim=64, exposure_feat_dim=32,
+                      grad_checkpoint=args.grad_ckpt).to(device)
     logger.info(f'Generator params: {sum(p.numel() for p in G.parameters()):,}')
 
     D = arch.Discriminator_VGG(in_nc=3, nf=64)
@@ -829,6 +889,7 @@ def main():
     arch_cfg = {
         'nf': args.nf, 'nb': args.nb, 'gc': args.gc, 'upscale': args.scale,
         'context_dim': 64, 'exposure_feat_dim': 32, 'upsample_mode': 'pixelshuffle',
+        'grad_checkpoint': args.grad_ckpt,
     }
     save_checkpoint(G, final_path, epoch=args.stage1_epochs + args.stage2_epochs + args.stage3_epochs,
                     arch_cfg=arch_cfg)
